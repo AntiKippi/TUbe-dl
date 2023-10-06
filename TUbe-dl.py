@@ -14,6 +14,7 @@ import os
 import requests
 import shutil
 import sys
+import threading
 
 from pyquery import PyQuery
 from string import Template
@@ -23,6 +24,12 @@ from urllib.parse import urlparse
 CHUNK_SIZE = 64*1024
 PROGRESS_SIGN = '#'
 NO_PROGRESS_SIGN = '-'
+
+
+class RepeatTimer(threading.Timer):
+    def run(self):
+        while not self.finished.wait(self.interval):
+            self.function(*self.args, **self.kwargs)
 
 
 def resume_download(fileurl, resume_byte_pos, headers=None):
@@ -138,20 +145,18 @@ def main():
         with resume_download(vidurl, position, headers={'Cookie': cookie}) as r:
             if len(name) - 3 > name_size:
                 # Truncate name to name_size
-                name_template = f'{name[:name_size-3]}...'
+                name_formatted = f'{name[:name_size-3]}...'
             else:
                 # Fill name with spaces to name_size
-                name_template = name + ' ' * (name_size - len(name))
+                name_formatted = name + ' ' * (name_size - len(name))
 
             if r.status_code == requests.codes.RANGE_NOT_SATISFIABLE:
-                print(f'{name_template}{" " * space_count}Already downloaded')
+                if not quiet:
+                    print(f'{name_formatted}{" " * space_count}Already downloaded')
                 continue
             elif r.status_code < 200 or r.status_code > 299:
-                print(f'Error downloading "{name}": {r.reason}')
+                sys.stderr.write(f'Error downloading "{name}": {r.reason}\n')
                 continue
-
-            content_size = r.headers.get('Content-Length')
-            downloaded = 0
 
             if r.headers.get('Accept-Ranges') in [None, 'none']:
                 # Overwrite the file if ranges are not supported
@@ -164,15 +169,19 @@ def main():
 
             if len(name) - 3 > name_size:
                 # Truncate name to name_size
-                name_template = f'{name[:name_size-3]}...'
+                name_formatted = f'{name[:name_size-3]}...'
             else:
                 # Fill name with spaces to name_size
-                name_template = name + ' ' * (name_size - len(name))
+                name_formatted = name + ' ' * (name_size - len(name))
 
-            progress_template = Template(f'{name_template}{" " * space_count}[$progress] $percent%')
+            progress_template = Template(f'{name_formatted}{" " * space_count}[$progress] $percent%')
             max_progress = progarea_size - 7    # The maximum number of PROGRESS_SIGNs to print
-            def print_progress(progress):
-                nonlocal progress_template, max_progress
+            content_size = r.headers.get('Content-Length')
+            downloaded = 0
+            def print_progress():
+                nonlocal progress_template, max_progress, content_size, downloaded
+
+                progress = downloaded / content_size
 
                 percent = f'{int(progress * 100):>3d}'
 
@@ -183,22 +192,34 @@ def main():
                 sys.stdout.write(f'\r{progress_template.substitute(progress=progress_string, percent=percent)}')
                 sys.stdout.flush()
 
+            print_progress_timer = RepeatTimer(1, print_progress)
+
             # Do not display progress bar if we cannot calculate the progress, print static content instead
-            if content_size is None:
-                if not quiet:
-                    print(f'Downloading "{name}"...')
-            else:
-                content_size = int(content_size)
-                print_progress(downloaded / content_size)
+            if not quiet:
+                if content_size is None:
+                        print(f'{name_formatted}{" " * space_count}Downloading...')
+                else:
+                    content_size = int(content_size)
+                    print_progress()
+                    print_progress_timer.start()
 
             with open(filename, filemode) as f:
                 for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                     f.write(chunk)
-                    downloaded += len(chunk)
+                    downloaded += CHUNK_SIZE
 
-                    # Display progress bar only if we can calculate progress
-                    if content_size is not None and not quiet:
-                        print_progress(downloaded / content_size)
+            if not quiet:
+                # Stop printing the progress
+                print_progress_timer.cancel()
+
+                # Since content_size is not always a multiple of CHUNK_SIZE, align the two to avoid having >100% progress
+                downloaded = content_size
+
+                # Print the progress one last time to override any potential >100% progress output
+                print_progress()
+
+                # Terminate the line to avoid overwriting
+                sys.stdout.write('\n')
 
 
 if __name__ == '__main__':
