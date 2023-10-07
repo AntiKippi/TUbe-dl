@@ -2,14 +2,15 @@
 
 ######################################################
 # TUbe-dl
-# Utility to download a playlist from TUbe (https://portal.tuwien.tv/)
+# Utility to download a video or playlist from TUbe (https://portal.tuwien.tv/)
 #
 # Author: Kippi
-# Version: 0.0.2
+# Version: 0.1.0
 ######################################################
 
 
 import argparse
+import json
 import os
 import requests
 import shutil
@@ -31,7 +32,7 @@ class RepeatTimer(threading.Timer):
 
 
 class ProgressFormatter:
-    PROGRESS_TEMPLATE = Template(f'[$progress] $percent%')
+    PROGRESS_TEMPLATE = Template('[$progress] $percent%')
     PROGRESS_SIGN = '#'
     NO_PROGRESS_SIGN = '-'
 
@@ -106,7 +107,7 @@ def download_video(vidurl, filename, cookie, prog_formatter, force=False, quiet=
             filemode = 'wb'
 
             if not force:
-                resp = input(f'Server does not support resumeable downloads, download whole file again? [y/N]: ').upper()
+                resp = input('Server does not support resumeable downloads, download whole file again? [y/N]: ').upper()
                 if resp not in ['Y', 'YES']:
                     return
 
@@ -159,7 +160,7 @@ def main():
 
     # Tolerate 32 spaces until the description is put a line below
     def more_indent_formatter(prog): return argparse.RawTextHelpFormatter(prog, max_help_position=32)
-    parser = argparse.ArgumentParser(description='Download add video items from TUbe', formatter_class=more_indent_formatter)
+    parser = argparse.ArgumentParser(description='Download a video or playlist from TUbe', formatter_class=more_indent_formatter)
     parser.add_argument('-c',
                         '--cookie',
                         type=str,
@@ -180,7 +181,7 @@ def main():
                         action='store',
                         dest='dir',
                         required=True,
-                        help='The directory to put the videos in. It will be created if it does not exist')
+                        help='The directory to put the video(s) in. It will be created if it does not exist')
     parser.add_argument('-q',
                         '--quiet',
                         action='store_true',
@@ -194,7 +195,7 @@ def main():
                         action='store',
                         dest='url',
                         required=True,
-                        help='The address of the video items')
+                        help='The address of the content as shown in your browsers address bar')
 
     # Set all arguments
     args = parser.parse_args()
@@ -211,17 +212,25 @@ def main():
         sys.stderr.write(f'Error fetching content from "{url}"')
         sys.exit(1)
 
-    videos = PyQuery(r.text)('#div_PLItemsList-Tour')
-
     # Create any parent directories if necessary
     os.makedirs(outdir, exist_ok=True)
+
+    # Extract video data in JSON format
+    data_element = PyQuery(r.text)('#hdn_PlayerData')
+    data_str = data_element.attr['value']
+    if data_str is not None:
+        video_data = json.loads(data_str)
+        videos = video_data['Playlist']
+    else:
+        sys.stderr.write('Error extracting video data, is your cookie valid?\n')
+        sys.exit(1)
 
     # Parse url for easy creation of full_vidurl
     url_parts = urlparse(url)
 
-    for video in videos.items('.playlist'):
-        vidurl = video.attr['data-vidurl']
-        name = video.find('.title').text()
+    for video in videos:
+        vidurl = video['MediaURL']
+        name = video['Title']
 
         # Make vidurl absolute and complete
         vidurl_parts = urlparse(vidurl)
