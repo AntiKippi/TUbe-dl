@@ -2,10 +2,10 @@
 
 ######################################################
 # TUbe-dl
-# Utility to download all video items from TUbe (https://portal.tuwien.tv/)
+# Utility to download a playlist from TUbe (https://portal.tuwien.tv/)
 #
 # Author: Kippi
-# Version: 0.0.1
+# Version: 0.0.2
 ######################################################
 
 
@@ -22,8 +22,6 @@ from urllib.parse import urlparse
 
 
 CHUNK_SIZE = 64*1024
-PROGRESS_SIGN = '#'
-NO_PROGRESS_SIGN = '-'
 
 
 class RepeatTimer(threading.Timer):
@@ -32,11 +30,126 @@ class RepeatTimer(threading.Timer):
             self.function(*self.args, **self.kwargs)
 
 
+class ProgressFormatter:
+    PROGRESS_TEMPLATE = Template(f'[$progress] $percent%')
+    PROGRESS_SIGN = '#'
+    NO_PROGRESS_SIGN = '-'
+
+    def __init__(self, name):
+        # Get terminal size and compute name and progress areas sizes
+        termwidth = shutil.get_terminal_size()[0]
+        self._name_size = self._progarea_size = int(termwidth/2 - 1)
+
+        # The maximum number of PROGRESS_SIGNs to print
+        self._max_progress = self._progarea_size - 7
+
+        # For symmetry's sake print 3 spaces when termwidth is odd and two if it is even
+        self._spaces = ' ' * (2 + termwidth % 2)
+
+        self.name = name
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        if len(value) - 3 > self._name_size:
+            # Truncate name to name_size
+            self._name = f'{value[:self._name_size-3]}...'
+        else:
+            # Fill name with spaces to name_size
+            self._name = value + ' ' * (self._name_size - len(value))
+
+    def format_progress(self, progress):
+        percent = f'{int(progress * 100):>3d}'
+
+        # Print a number of PROGRESS_SIGNs relative to the progress made and fill the rest up with NO_PROGRESS_SIGN
+        progress_bar = int(self._max_progress * progress) * self.PROGRESS_SIGN
+        progress_bar += self.NO_PROGRESS_SIGN * (self._max_progress - len(progress_bar))
+
+        progress_string = self.PROGRESS_TEMPLATE.substitute(progress=progress_bar, percent=percent)
+
+        return f'{self.name}{self._spaces}{progress_string}'
+
+    def format_msg(self, msg):
+        return f'{self.name}{self._spaces}{msg}'
+
+
 def resume_download(fileurl, resume_byte_pos, headers=None):
     if headers is None:
         headers = {}
     headers['Range'] = f'bytes={resume_byte_pos}-'
     return requests.get(fileurl, headers=headers, stream=True, timeout=10)
+
+
+def download_video(vidurl, filename, cookie, prog_formatter, force=False, quiet=False):
+    filemode = 'ab'
+
+    # Get position for resuming the download
+    try:
+        position = os.path.getsize(filename)
+    except FileNotFoundError:
+        position = 0
+        filemode = 'wb'
+
+    with resume_download(vidurl, position, headers={'Cookie': cookie}) as r:
+        if r.status_code == requests.codes.RANGE_NOT_SATISFIABLE:
+            if not quiet:
+                print(prog_formatter.format_msg('Already downloaded'))
+            return
+        else:
+            r.raise_for_status()
+
+        if r.headers.get('Accept-Ranges') in [None, 'none']:
+            # Overwrite the file if ranges are not supported
+            filemode = 'wb'
+
+            if not force:
+                resp = input(f'Server does not support resumeable downloads, download whole file again? [y/N]: ').upper()
+                if resp not in ['Y', 'YES']:
+                    return
+
+        content_size = r.headers.get('Content-Length')
+        downloaded = 0
+        def print_progress():
+            nonlocal prog_formatter, content_size, downloaded
+
+            sys.stdout.write(f'\r{prog_formatter.format_progress(downloaded / content_size)}')
+            sys.stdout.flush()
+
+        # Print progress every 0.5s
+        print_progress_timer = RepeatTimer(0.5, print_progress)
+
+        # Stop print_progress_timer on CTRL+C
+        print_progress_timer.daemon = True
+
+        # Do not display progress bar if we cannot calculate the progress, print static content instead
+        if not quiet:
+            if content_size is None:
+                print(prog_formatter.format_msg('Downloading...'))
+            else:
+                content_size = int(content_size)
+                print_progress()
+                print_progress_timer.start()
+
+        with open(filename, filemode) as f:
+            for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                f.write(chunk)
+                downloaded += CHUNK_SIZE
+
+        if not quiet:
+            # Stop printing the progress
+            print_progress_timer.cancel()
+
+            # Since content_size is not always a multiple of CHUNK_SIZE, align the two to avoid having >100% progress
+            downloaded = content_size
+
+            # Print the progress one last time to override any potential >100% progress output
+            print_progress()
+
+            # Terminate the line to avoid overwriting
+            sys.stdout.write('\n')
 
 
 def main():
@@ -103,11 +216,6 @@ def main():
     # Create any parent directories if necessary
     os.makedirs(outdir, exist_ok=True)
 
-    # Get terminal size and compute name and progress areas sizes
-    termwidth = shutil.get_terminal_size()[0]
-    name_size = progarea_size = int(termwidth/2 - 1)
-    space_count = 2 + termwidth % 2
-
     # Parse url for easy creation of full_vidurl
     url_parts = urlparse(url)
 
@@ -133,93 +241,10 @@ def main():
             # else: vidurl = vidurl
 
         filename = os.path.join(outdir, f'{name}.mp4')
-        filemode = 'ab'
-
-        # Get position for resuming the download
         try:
-            position = os.path.getsize(filename)
-        except FileNotFoundError:
-            position = 0
-            filemode = 'wb'
-
-        with resume_download(vidurl, position, headers={'Cookie': cookie}) as r:
-            if len(name) - 3 > name_size:
-                # Truncate name to name_size
-                name_formatted = f'{name[:name_size-3]}...'
-            else:
-                # Fill name with spaces to name_size
-                name_formatted = name + ' ' * (name_size - len(name))
-
-            if r.status_code == requests.codes.RANGE_NOT_SATISFIABLE:
-                if not quiet:
-                    print(f'{name_formatted}{" " * space_count}Already downloaded')
-                continue
-            elif r.status_code < 200 or r.status_code > 299:
-                sys.stderr.write(f'Error downloading "{name}": {r.reason}\n')
-                continue
-
-            if r.headers.get('Accept-Ranges') in [None, 'none']:
-                # Overwrite the file if ranges are not supported
-                filemode = 'wb'
-
-                if not force:
-                    resp = input(f'Server does not support resumeable downloads, download whole file again? [y/N]: ').upper()
-                    if resp not in ['Y', 'YES']:
-                        continue
-
-            if len(name) - 3 > name_size:
-                # Truncate name to name_size
-                name_formatted = f'{name[:name_size-3]}...'
-            else:
-                # Fill name with spaces to name_size
-                name_formatted = name + ' ' * (name_size - len(name))
-
-            progress_template = Template(f'{name_formatted}{" " * space_count}[$progress] $percent%')
-            max_progress = progarea_size - 7    # The maximum number of PROGRESS_SIGNs to print
-            content_size = r.headers.get('Content-Length')
-            downloaded = 0
-            def print_progress():
-                nonlocal progress_template, max_progress, content_size, downloaded
-
-                progress = downloaded / content_size
-
-                percent = f'{int(progress * 100):>3d}'
-
-                # Print a number of PROGRESS_SIGNs relative to the progress made and fill the rest up with NO_PROGRESS_SIGN
-                progress_string = int(max_progress * progress) * PROGRESS_SIGN
-                progress_string += NO_PROGRESS_SIGN * (max_progress - len(progress_string))
-
-                sys.stdout.write(f'\r{progress_template.substitute(progress=progress_string, percent=percent)}')
-                sys.stdout.flush()
-
-            print_progress_timer = RepeatTimer(1, print_progress)
-
-            # Do not display progress bar if we cannot calculate the progress, print static content instead
-            if not quiet:
-                if content_size is None:
-                        print(f'{name_formatted}{" " * space_count}Downloading...')
-                else:
-                    content_size = int(content_size)
-                    print_progress()
-                    print_progress_timer.start()
-
-            with open(filename, filemode) as f:
-                for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
-                    f.write(chunk)
-                    downloaded += CHUNK_SIZE
-
-            if not quiet:
-                # Stop printing the progress
-                print_progress_timer.cancel()
-
-                # Since content_size is not always a multiple of CHUNK_SIZE, align the two to avoid having >100% progress
-                downloaded = content_size
-
-                # Print the progress one last time to override any potential >100% progress output
-                print_progress()
-
-                # Terminate the line to avoid overwriting
-                sys.stdout.write('\n')
+            download_video(vidurl, filename, cookie, ProgressFormatter(name), force, quiet)
+        except Exception as e:
+            sys.stderr.write(f'Error downloading "{name}": {e}\n')
 
 
 if __name__ == '__main__':
