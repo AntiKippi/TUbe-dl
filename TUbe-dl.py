@@ -32,21 +32,26 @@ class RepeatTimer(threading.Timer):
 
 
 class ProgressFormatter:
-    PROGRESS_TEMPLATE = Template('[$progress] $percent%')
+    # Constants
+    PROGRESS_TEMPLATE = '[{progress}] {percent}%'
     PROGRESS_SIGN = '#'
     NO_PROGRESS_SIGN = '-'
+    PROGRESS_OTHER_CHAR_COUNT = 7
+
+    # Statically computed variables
+    # Compute terminal size and name and progress areas sizes
+    _termwidth = shutil.get_terminal_size()[0]
+    _name_size = _progarea_size = int(_termwidth/2 - 1)
+
+    # The maximum number of PROGRESS_SIGNs to print
+    # Computed by subtracting the number of other chars than the progress bar (e.g. the %, spaces and brackets)
+    # from the progress area
+    _max_progress = _progarea_size - PROGRESS_OTHER_CHAR_COUNT
+
+    # For symmetry's sake print 3 spaces when termwidth is odd and two if it is even
+    _spaces = ' ' * (2 + _termwidth % 2)
 
     def __init__(self, name):
-        # Get terminal size and compute name and progress areas sizes
-        termwidth = shutil.get_terminal_size()[0]
-        self._name_size = self._progarea_size = int(termwidth/2 - 1)
-
-        # The maximum number of PROGRESS_SIGNs to print
-        self._max_progress = self._progarea_size - 7
-
-        # For symmetry's sake print 3 spaces when termwidth is odd and two if it is even
-        self._spaces = ' ' * (2 + termwidth % 2)
-
         self.name = name
 
     @property
@@ -69,7 +74,7 @@ class ProgressFormatter:
         progress_bar = int(self._max_progress * progress) * self.PROGRESS_SIGN
         progress_bar += self.NO_PROGRESS_SIGN * (self._max_progress - len(progress_bar))
 
-        progress_string = self.PROGRESS_TEMPLATE.substitute(progress=progress_bar, percent=percent)
+        progress_string = self.PROGRESS_TEMPLATE.format(progress=progress_bar, percent=percent)
 
         return f'{self.name}{self._spaces}{progress_string}'
 
@@ -102,7 +107,18 @@ def download_video(vidurl, filename, cookie, prog_formatter, force=False, quiet=
         else:
             r.raise_for_status()
 
+        content_size = r.headers.get('Content-Length')
+
+        if content_size is not None:
+            content_size = int(content_size)
+
         if r.headers.get('Accept-Ranges') in [None, 'none']:
+            # Skip if the file was already downloaded
+            if position == content_size:
+                if not quiet:
+                    print(prog_formatter.format_msg('Already downloaded'))
+                return
+
             # Overwrite the file if ranges are not supported
             filemode = 'wb'
 
@@ -111,7 +127,6 @@ def download_video(vidurl, filename, cookie, prog_formatter, force=False, quiet=
                 if resp not in ['Y', 'YES']:
                     return
 
-        content_size = r.headers.get('Content-Length')
         downloaded = 0
         def print_progress():
             nonlocal prog_formatter, content_size, downloaded
@@ -125,12 +140,11 @@ def download_video(vidurl, filename, cookie, prog_formatter, force=False, quiet=
         # Stop print_progress_timer on CTRL+C
         print_progress_timer.daemon = True
 
-        # Do not display progress bar if we cannot calculate the progress, print static content instead
         if not quiet:
+            # Do not display progress bar if we cannot calculate the progress, print static content instead
             if content_size is None:
                 print(prog_formatter.format_msg('Downloading...'))
             else:
-                content_size = int(content_size)
                 print_progress()
                 print_progress_timer.start()
 
@@ -139,7 +153,7 @@ def download_video(vidurl, filename, cookie, prog_formatter, force=False, quiet=
                 f.write(chunk)
                 downloaded += CHUNK_SIZE
 
-        if not quiet:
+        if not quiet and content_size is not None:
             # Stop printing the progress
             print_progress_timer.cancel()
 
@@ -212,9 +226,6 @@ def main():
         sys.stderr.write(f'Error fetching content from "{url}"')
         sys.exit(1)
 
-    # Create any parent directories if necessary
-    os.makedirs(outdir, exist_ok=True)
-
     # Extract video data in JSON format
     data_element = PyQuery(r.text)('#hdn_PlayerData')
     data_str = data_element.attr['value']
@@ -224,6 +235,9 @@ def main():
     else:
         sys.stderr.write('Error extracting video data, is your cookie valid?\n')
         sys.exit(1)
+
+    # Create any parent directories if necessary
+    os.makedirs(outdir, exist_ok=True)
 
     # Parse url for easy creation of full_vidurl
     url_parts = urlparse(url)
